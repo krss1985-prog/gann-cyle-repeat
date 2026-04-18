@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -96,14 +98,88 @@ def parse_manual_cycles(text: str) -> List[float]:
     return sorted(set(out))
 
 
+_YF_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_YF_API_URLS = [
+    "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}",
+    "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+]
+
+
+def _fetch_yahoo_direct(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch price history via direct Yahoo Finance v8 chart API (no curl_cffi / cookie needed)."""
+    p1 = int(pd.Timestamp(start).timestamp())
+    p2 = int(pd.Timestamp(end).timestamp())
+    params = {"period1": p1, "period2": p2, "interval": "1d", "events": "history", "includeAdjustedClose": "true"}
+
+    session = requests.Session()
+    session.headers.update(_YF_HEADERS)
+
+    for url_tpl in _YF_API_URLS:
+        url = url_tpl.format(ticker=ticker)
+        for attempt in range(3):
+            try:
+                resp = session.get(url, params=params, timeout=30)
+                if resp.status_code != 200:
+                    time.sleep(1)
+                    continue
+                payload = resp.json()
+                result = payload.get("chart", {}).get("result")
+                if not result:
+                    return pd.DataFrame()
+                result = result[0]
+                timestamps = result.get("timestamp", [])
+                indicators = result.get("indicators", {})
+                quote = indicators.get("quote", [{}])[0]
+                adjclose_list = indicators.get("adjclose", [{}])
+                adjclose = adjclose_list[0].get("adjclose", []) if adjclose_list else []
+
+                if not timestamps:
+                    return pd.DataFrame()
+
+                idx = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("America/New_York").normalize().tz_localize(None)
+                close_vals = adjclose if len(adjclose) == len(timestamps) else quote.get("close", [])
+                df = pd.DataFrame(
+                    {
+                        "Open": quote.get("open", [np.nan] * len(timestamps)),
+                        "High": quote.get("high", [np.nan] * len(timestamps)),
+                        "Low": quote.get("low", [np.nan] * len(timestamps)),
+                        "Close": close_vals if close_vals else [np.nan] * len(timestamps),
+                        "Volume": quote.get("volume", [np.nan] * len(timestamps)),
+                    },
+                    index=idx,
+                )
+                df = df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+                if not df.empty:
+                    return df
+            except Exception:
+                time.sleep(1)
+    return pd.DataFrame()
+
+
 @st.cache_data(show_spinner=False)
 def load_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
+    # Primary: direct Yahoo Finance chart API (no curl_cffi / GDPR cookie needed)
+    df = _fetch_yahoo_direct(ticker, start, end)
+    if df is not None and not df.empty:
+        return df
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
+    # Fallback: yfinance library
+    try:
+        df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+    except Exception:
+        return pd.DataFrame()
 
     needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df = df[needed].copy()
