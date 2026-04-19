@@ -106,72 +106,176 @@ _YF_HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://finance.yahoo.com",
+    "Referer": "https://finance.yahoo.com/",
 }
-_YF_API_URLS = [
-    "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}",
+_YF_CHART_URLS = [
     "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+    "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}",
 ]
+
+# Module-level crumb cache: avoids re-fetching on every Streamlit rerun
+_yf_crumb_cache: dict = {"crumb": "", "expires": 0.0}
+
+
+def _build_yahoo_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_YF_HEADERS)
+    return s
+
+
+def _get_yahoo_crumb(session: requests.Session) -> str:
+    """Fetch a Yahoo Finance crumb via the standard cookie+crumb handshake.
+
+    Steps:
+    1. GET finance.yahoo.com  → sets A1/A3 consent cookies (no GDPR redirect needed outside EU)
+    2. GET /v1/test/getcrumb  → returns a short crumb string used in subsequent API calls
+    """
+    global _yf_crumb_cache
+
+    now = time.monotonic()
+    if _yf_crumb_cache["crumb"] and now < _yf_crumb_cache["expires"]:
+        return _yf_crumb_cache["crumb"]
+
+    # Step 1: prime cookies from the main page
+    for home in ("https://finance.yahoo.com/", "https://yahoo.com/"):
+        try:
+            session.get(home, timeout=10, allow_redirects=True)
+            break
+        except Exception:
+            pass
+
+    # Step 2: fetch crumb
+    crumb = ""
+    for url in (
+        "https://query1.finance.yahoo.com/v1/test/getcrumb",
+        "https://query2.finance.yahoo.com/v1/test/getcrumb",
+    ):
+        try:
+            r = session.get(url, timeout=10)
+            if r.status_code == 200:
+                text = r.text.strip()
+                if text and text.lower() not in ("null", "forbidden"):
+                    crumb = text
+                    break
+        except Exception:
+            pass
+
+    if crumb:
+        # Cache for 55 minutes (Yahoo crumbs expire after ~1 hour)
+        _yf_crumb_cache = {"crumb": crumb, "expires": now + 3300.0}
+
+    return crumb
+
+
+def _parse_yahoo_chart_response(resp_json: dict) -> pd.DataFrame:
+    """Parse a Yahoo Finance v8 chart JSON payload into a price DataFrame."""
+    result = resp_json.get("chart", {}).get("result")
+    if not result:
+        return pd.DataFrame()
+
+    result = result[0]
+    timestamps = result.get("timestamp") or []
+    if not timestamps:
+        return pd.DataFrame()
+
+    indicators = result.get("indicators", {})
+    quote = (indicators.get("quote") or [{}])[0]
+    adjclose_list = indicators.get("adjclose") or []
+    adjclose = adjclose_list[0].get("adjclose", []) if adjclose_list else []
+
+    n = len(timestamps)
+    close_vals = adjclose if len(adjclose) == n else quote.get("close", [np.nan] * n)
+
+    idx = (
+        pd.to_datetime(timestamps, unit="s", utc=True)
+        .tz_convert("America/New_York")
+        .normalize()
+        .tz_localize(None)
+    )
+    df = pd.DataFrame(
+        {
+            "Open": quote.get("open", [np.nan] * n),
+            "High": quote.get("high", [np.nan] * n),
+            "Low": quote.get("low", [np.nan] * n),
+            "Close": close_vals if close_vals else [np.nan] * n,
+            "Volume": quote.get("volume", [np.nan] * n),
+        },
+        index=idx,
+    )
+    return df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
 
 
 def _fetch_yahoo_direct(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Fetch price history via direct Yahoo Finance v8 chart API (no curl_cffi / cookie needed)."""
+    """Fetch price history via direct Yahoo Finance v8 chart API.
+
+    Uses the standard cookie + crumb handshake so the call works on Render
+    (avoids curl_cffi / guce.yahoo.com GDPR redirect that blocks on non-EU hosts).
+    """
     p1 = int(pd.Timestamp(start).timestamp())
     p2 = int(pd.Timestamp(end).timestamp())
-    params = {"period1": p1, "period2": p2, "interval": "1d", "events": "history", "includeAdjustedClose": "true"}
 
-    session = requests.Session()
-    session.headers.update(_YF_HEADERS)
+    session = _build_yahoo_session()
+    crumb = _get_yahoo_crumb(session)
 
-    for url_tpl in _YF_API_URLS:
+    base_params: dict = {
+        "period1": p1,
+        "period2": p2,
+        "interval": "1d",
+        "events": "history",
+        "includeAdjustedClose": "true",
+    }
+    if crumb:
+        base_params["crumb"] = crumb
+
+    for url_tpl in _YF_CHART_URLS:
         url = url_tpl.format(ticker=ticker)
         for attempt in range(3):
             try:
-                resp = session.get(url, params=params, timeout=30)
+                resp = session.get(url, params=base_params, timeout=30)
+
+                if resp.status_code in (401, 403):
+                    # Crumb expired or missing — try to refresh once, then give up this URL
+                    _yf_crumb_cache["crumb"] = ""
+                    new_crumb = _get_yahoo_crumb(session)
+                    if not new_crumb:
+                        break  # crumb refresh failed; skip remaining attempts for this URL
+                    crumb = new_crumb
+                    base_params["crumb"] = crumb
+                    time.sleep(1)
+                    continue
+
                 if resp.status_code != 200:
                     time.sleep(1)
                     continue
-                payload = resp.json()
-                result = payload.get("chart", {}).get("result")
-                if not result:
-                    return pd.DataFrame()
-                result = result[0]
-                timestamps = result.get("timestamp", [])
-                indicators = result.get("indicators", {})
-                quote = indicators.get("quote", [{}])[0]
-                adjclose_list = indicators.get("adjclose", [{}])
-                adjclose = adjclose_list[0].get("adjclose", []) if adjclose_list else []
 
-                if not timestamps:
-                    return pd.DataFrame()
+                try:
+                    payload = resp.json()
+                except Exception:
+                    time.sleep(1)
+                    continue
 
-                idx = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("America/New_York").normalize().tz_localize(None)
-                close_vals = adjclose if len(adjclose) == len(timestamps) else quote.get("close", [])
-                df = pd.DataFrame(
-                    {
-                        "Open": quote.get("open", [np.nan] * len(timestamps)),
-                        "High": quote.get("high", [np.nan] * len(timestamps)),
-                        "Low": quote.get("low", [np.nan] * len(timestamps)),
-                        "Close": close_vals if close_vals else [np.nan] * len(timestamps),
-                        "Volume": quote.get("volume", [np.nan] * len(timestamps)),
-                    },
-                    index=idx,
-                )
-                df = df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+                df = _parse_yahoo_chart_response(payload)
                 if not df.empty:
                     return df
+
+                # Chart result was empty (bad ticker / no data)
+                return pd.DataFrame()
+
             except Exception:
                 time.sleep(1)
+
     return pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False)
 def load_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
-    # Primary: direct Yahoo Finance chart API (no curl_cffi / GDPR cookie needed)
+    # Primary: direct Yahoo Finance chart API with cookie+crumb auth
     df = _fetch_yahoo_direct(ticker, start, end)
     if df is not None and not df.empty:
         return df
 
-    # Fallback: yfinance library
+    # Fallback: yfinance library (may work on some hosts / future versions)
     try:
         df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
         if df is None or df.empty:
@@ -627,11 +731,17 @@ with st.sidebar:
 run_scan = st.button("Kjør v2-scan", type="primary")
 
 if run_scan:
-    with st.spinner("Laster Yahoo-data..."):
+    with st.spinner("Laster Yahoo-data (henter cookie + crumb)..."):
         df = load_price_history(ticker, str(start_date), str(end_date))
 
     if df.empty or "Close" not in df.columns:
-        st.error("Fant ingen prisdata fra Yahoo for valgt ticker/periode.")
+        st.error(
+            f"Fant ingen prisdata for **{ticker}** ({start_date} → {end_date}).\n\n"
+            "Mulige årsaker:\n"
+            "- Feil ticker-symbol (prøv f.eks. `AAPL`, `SPY`, `EURUSD=X`)\n"
+            "- Yahoo Finance er midlertidig utilgjengelig – vent litt og prøv igjen\n"
+            "- Render-instansen er blokkert av Yahoo – restart tjenesten i Render-dashboardet"
+        )
         st.stop()
 
     analysis_end_ts = pd.Timestamp(analysis_end_date)
