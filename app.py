@@ -10,7 +10,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import yfinance as yf
 
 
 # Gann Cycle Repeat Scanner v2
@@ -98,6 +97,84 @@ def parse_manual_cycles(text: str) -> List[float]:
     return sorted(set(out))
 
 
+# ---------------------------------------------------------------
+# Stooq data source (primary – no auth, cloud-friendly)
+# ---------------------------------------------------------------
+_STOOQ_INDEX_MAP = {
+    "^GSPC": "^SPX",
+    "^DJI": "^DJI",
+    "^NDX": "^NDX",
+    "^RUT": "^RUT",
+    "^VIX": "^VIX",
+    "^FTSE": "^FTS",
+    "^N225": "^NKX",
+    "^HSI": "^HSI",
+}
+
+
+def _to_stooq_ticker(yahoo_ticker: str) -> str:
+    """Convert a Yahoo Finance ticker string to Stooq format."""
+    t = yahoo_ticker.strip().upper()
+    # Named index overrides
+    if t in _STOOQ_INDEX_MAP:
+        return _STOOQ_INDEX_MAP[t]
+    # Currency pairs: EURUSD=X → EURUSD
+    if t.endswith("=X"):
+        return t[:-2]
+    # Futures: GC=F → GC.F
+    if t.endswith("=F"):
+        return t[:-2] + ".F"
+    # Plain indices already start with ^
+    if t.startswith("^"):
+        return t
+    # US equities / ETFs
+    if "." not in t:
+        return t + ".US"
+    return t
+
+
+def _fetch_stooq(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Download daily OHLCV data from stooq.com (CSV, no authentication)."""
+    from io import StringIO
+
+    stooq_sym = _to_stooq_ticker(ticker)
+    d1 = pd.Timestamp(start).strftime("%Y%m%d")
+    d2 = pd.Timestamp(end).strftime("%Y%m%d")
+    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&d1={d1}&d2={d2}&i=d"
+
+    try:
+        resp = requests.get(
+            url,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"},
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return pd.DataFrame()
+
+        text = resp.text.strip()
+        # Stooq returns "No data" or similar when symbol is unknown
+        if not text or "No data" in text or len(text.splitlines()) < 2:
+            return pd.DataFrame()
+
+        df = pd.read_csv(StringIO(text))
+        if df.empty or "Date" not in df.columns or "Close" not in df.columns:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date")
+        df.index.name = None
+        df = df.rename(columns=str)  # ensure string column names
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        return df[needed].dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------
+# Yahoo Finance data source (secondary fallback)
+# ---------------------------------------------------------------
 _YF_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -270,9 +347,14 @@ def _fetch_yahoo_direct(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
-    # Primary: yfinance 1.x uses curl_cffi with Chrome TLS impersonation, which
-    # reliably bypasses Yahoo Finance bot detection on cloud servers (Render etc.)
+    # Primary: Stooq (free CSV, no auth, works from cloud servers)
+    df = _fetch_stooq(ticker, start, end)
+    if df is not None and not df.empty:
+        return df
+
+    # Secondary: yfinance 1.x uses curl_cffi Chrome TLS impersonation
     try:
+        import yfinance as yf  # noqa: PLC0415
         df = yf.download(
             ticker,
             start=start,
@@ -293,7 +375,7 @@ def load_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback: direct Yahoo Finance chart API with cookie+crumb auth
+    # Tertiary: direct Yahoo Finance chart API with cookie+crumb auth
     df = _fetch_yahoo_direct(ticker, start, end)
     if df is not None and not df.empty:
         return df
@@ -685,7 +767,7 @@ def make_match_label(m: CycleMatch) -> str:
 # -----------------------------
 st.set_page_config(page_title="Gann Cycle Repeat Scanner v2", layout="wide")
 st.title("Gann Cycle Repeat Scanner v2.1")
-st.caption("Yahoo prisdata + Gann års-sykluser + multi-window scan + in-sample alignment + ekte forward composite forecast")
+st.caption("Prisdata via Stooq / yfinance / Yahoo Finance + Gann års-sykluser + multi-window scan + in-sample alignment + ekte forward composite forecast")
 
 with st.sidebar:
     st.header("Data")
@@ -737,19 +819,56 @@ with st.sidebar:
     show_forecast_only = st.checkbox("Vis eget forecast-panel", value=True)
     show_forward_hit_table = st.checkbox("Vis forward score-tabell", value=True)
 
+    st.header("Last opp CSV (valgfritt)")
+    st.caption(
+        "Hvis automatisk datahenting feiler, last opp en CSV-fil med kolonner: "
+        "**Date** (YYYY-MM-DD) og **Close** (pluss valgfritt Open, High, Low, Volume)."
+    )
+    uploaded_file = st.file_uploader("Last opp prisdata (CSV)", type=["csv"])
+
 run_scan = st.button("Kjør v2-scan", type="primary")
 
 if run_scan:
-    with st.spinner("Laster Yahoo-data (henter cookie + crumb)..."):
-        df = load_price_history(ticker, str(start_date), str(end_date))
+    # --- CSV upload takes priority over any network fetch ---
+    if uploaded_file is not None:
+        try:
+            from io import StringIO as _SIO  # noqa: PLC0415
+            _raw = uploaded_file.read().decode("utf-8", errors="replace")
+            _udf = pd.read_csv(_SIO(_raw))
+            # Flexible date column detection
+            _date_col = next(
+                (c for c in _udf.columns if c.strip().lower() in ("date", "dato", "time", "timestamp")),
+                None,
+            )
+            if _date_col:
+                _udf[_date_col] = pd.to_datetime(_udf[_date_col], errors="coerce")
+                _udf = _udf.dropna(subset=[_date_col]).set_index(_date_col)
+                _udf.index.name = None
+                _udf.columns = [c.strip().capitalize() for c in _udf.columns]
+                _needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in _udf.columns]
+                if _needed and "Close" in _needed:
+                    df = _udf[_needed].apply(pd.to_numeric, errors="coerce")
+                    df = df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+                else:
+                    df = pd.DataFrame()
+            else:
+                df = pd.DataFrame()
+        except Exception:
+            df = pd.DataFrame()
+        if df.empty:
+            st.error("Klarte ikke å lese CSV-filen. Sjekk at den har kolonnene 'Date' og 'Close'.")
+            st.stop()
+    else:
+        with st.spinner("Henter prisdata (Stooq → yfinance → Yahoo Finance)..."):
+            df = load_price_history(ticker, str(start_date), str(end_date))
 
     if df.empty or "Close" not in df.columns:
         st.error(
             f"Fant ingen prisdata for **{ticker}** ({start_date} → {end_date}).\n\n"
-            "Mulige årsaker:\n"
-            "- Feil ticker-symbol (prøv f.eks. `AAPL`, `SPY`, `EURUSD=X`)\n"
-            "- Yahoo Finance er midlertidig utilgjengelig – vent litt og prøv igjen\n"
-            "- Render-instansen er blokkert av Yahoo – restart tjenesten i Render-dashboardet"
+            "**Alternativ 1 – Stooq-ticker:** Stooq bruker `AAPL.US` for US-aksjer og `^SPX` for S&P 500. "
+            "Prøv å skrive inn Stooq-tickeren direkte i *Eller skriv ticker selv*-feltet.\n\n"
+            "**Alternativ 2 – Last opp CSV:** Last ned data fra f.eks. "
+            "[Yahoo Finance](https://finance.yahoo.com) (Download → CSV) og last den opp i sidemenyen."
         )
         st.stop()
 
