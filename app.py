@@ -270,26 +270,35 @@ def _fetch_yahoo_direct(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
-    # Primary: direct Yahoo Finance chart API with cookie+crumb auth
+    # Primary: yfinance 1.x uses curl_cffi with Chrome TLS impersonation, which
+    # reliably bypasses Yahoo Finance bot detection on cloud servers (Render etc.)
+    try:
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+            multi_level_index=False,
+        )
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            if needed:
+                df = df[needed].copy()
+                df = df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+                if not df.empty:
+                    return df
+    except Exception:
+        pass
+
+    # Fallback: direct Yahoo Finance chart API with cookie+crumb auth
     df = _fetch_yahoo_direct(ticker, start, end)
     if df is not None and not df.empty:
         return df
 
-    # Fallback: yfinance library (may work on some hosts / future versions)
-    try:
-        df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-    except Exception:
-        return pd.DataFrame()
-
-    needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    df = df[needed].copy()
-    df = df[~df.index.duplicated(keep="last")]
-    df = df.sort_index()
-    return df.dropna()
+    return pd.DataFrame()
 
 
 def to_numpy(x: pd.Series) -> np.ndarray:
